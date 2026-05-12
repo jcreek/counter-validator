@@ -1,0 +1,6 @@
+# Normalise line endings. Shell scripts MUST stay LF or they break when run in
+# Linux containers (a CRLF shebang makes the kernel look for an interpreter that
+# does not exist — e.g. `env: 'bash\r': No such file or directory`). This guards
+# every checkout regardless of the developer's core.autocrlf setting.
+* text=auto eol=lf
+*.sh text eol=lf

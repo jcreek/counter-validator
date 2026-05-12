@@ -240,6 +240,10 @@ EMAIL_SUBJECT_PREFIX = config("EMAIL_SUBJECT_PREFIX", default="[COUNTER Validato
 SERVER_EMAIL = config("SERVER_EMAIL", default="root@localhost")
 DEFAULT_FROM_EMAIL = config("DEFAULT_FROM_EMAIL", default="root@localhost")
 EMAIL_HOST = config("EMAIL_HOST", default="localhost")
+# Overridable so the self-hosting Docker stack can default to the console
+# backend (see docker-compose.yml) and work without an SMTP server. A real
+# deployment sets MAILGUN_API_KEY (below) or EMAIL_BACKEND + EMAIL_HOST.
+EMAIL_BACKEND = config("EMAIL_BACKEND", default="django.core.mail.backends.smtp.EmailBackend")
 
 if MAILGUN_API_KEY := config("MAILGUN_API_KEY", default=""):
     # if we have the mailgun api key, we activate mailgun

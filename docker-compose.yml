@@ -1,0 +1,151 @@
+# Self-hosting compose stack for the COUNTER Validator.
+#
+# Six services on a single bridge network:
+#   validator-db       Postgres for the validator's persistent state
+#   validator-redis    Celery broker
+#   c5tools            PHP validation engine (built from ubfr/c5tools git URL)
+#   validator-web      Django REST API + admin (gunicorn)
+#   validator-worker   Celery worker
+#   validator-frontend nginx serving the Vue SPA + reverse-proxying the API
+#
+# Quick start:
+#   cp .env.example .env       # then edit SECRET_KEY and DB_PASSWORD
+#   docker compose up -d       # validator-web auto-runs migrate + collectstatic on boot
+#   docker compose exec validator-web python manage.py createsuperuser
+#   # open http://localhost:8888  (or whatever DOCKER_FRONTEND_PORT you set)
+
+# Shared email config for the services that send mail: validator-web (registration,
+# verification, password reset) and validator-worker (operator notifications + the
+# daily report). Defaults to the console backend so everything works out of the box
+# without an SMTP server — emails print to the container logs. For real delivery set
+# MAILGUN_API_KEY, or EMAIL_BACKEND + EMAIL_HOST. Kept in one anchor so web and
+# worker can never drift apart.
+x-email-env: &email-env
+  EMAIL_BACKEND: "${EMAIL_BACKEND:-django.core.mail.backends.console.EmailBackend}"
+  EMAIL_HOST: "${EMAIL_HOST:-localhost}"
+  DEFAULT_FROM_EMAIL: "${DEFAULT_FROM_EMAIL:-root@localhost}"
+
+services:
+  validator-db:
+    image: postgres:16-alpine
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_DB: ${DB_NAME:-coval}
+      POSTGRES_USER: ${DB_USER:-coval}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required. Copy .env.example to .env and edit it before running docker compose up.}
+    healthcheck:
+      test:
+        ["CMD-SHELL", "pg_isready -U ${DB_USER:-coval} -d ${DB_NAME:-coval}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  validator-redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # c5tools is the PHP validation engine (ubfr/c5tools). The validator's
+  # Celery worker hard-requires it (see config/settings/base.py:
+  # VALIDATION_MODULES_URLS). Built from a pinned upstream tag — bump
+  # the fragment below to update.
+  c5tools:
+    build:
+      context: https://github.com/ubfr/c5tools.git#v0.8.3
+    environment:
+      SSL_MODE: "off"
+      PHP_OPCACHE_ENABLE: "1"
+
+  validator-web:
+    build:
+      context: .
+      target: web
+    depends_on:
+      validator-db:
+        condition: service_healthy
+      validator-redis:
+        condition: service_healthy
+      c5tools:
+        condition: service_started
+    environment:
+      SECRET_KEY: ${SECRET_KEY:?SECRET_KEY is required. Copy .env.example to .env and edit it before running docker compose up.}
+      DEBUG: "${DEBUG:-False}"
+      ALLOWED_HOSTS: "${ALLOWED_HOSTS:-localhost,127.0.0.1}"
+      # Defaults to localhost on DOCKER_FRONTEND_PORT (the nginx config forwards
+      # the original Host:port so Django's CSRF origin check matches). If you
+      # front this with a domain or TLS, set CSRF_TRUSTED_ORIGINS explicitly.
+      CSRF_TRUSTED_ORIGINS: "${CSRF_TRUSTED_ORIGINS:-http://localhost:${DOCKER_FRONTEND_PORT:-8888}}"
+      DB_NAME: ${DB_NAME:-coval}
+      DB_USER: ${DB_USER:-coval}
+      DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required. Copy .env.example to .env and edit it before running docker compose up.}
+      DB_HOST: validator-db
+      DB_PORT: ${DB_PORT:-5432}
+      REDIS_HOST: ${REDIS_HOST:-validator-redis}
+      REDIS_PORT: ${REDIS_PORT:-6379}
+      VALIDATION_MODULES_URLS: ${VALIDATION_MODULES_URLS:-http://c5tools:8080/}
+      ALLOW_USER_REGISTRATION: "${ALLOW_USER_REGISTRATION:-False}"
+      # Served under /django-admin/ so it doesn't shadow the SPA's own /admin/*
+      # routes (e.g. /admin/users). The nginx config hardcodes this exact prefix
+      # in its location block, so if you change DJANGO_ADMIN_PATH you MUST update
+      # docker/nginx.conf to match — otherwise the admin site becomes unreachable.
+      DJANGO_ADMIN_PATH: "${DJANGO_ADMIN_PATH:-django-admin/}"
+      # Email backend etc., shared with validator-worker — see x-email-env above.
+      <<: *email-env
+      # Optional: if both are set, web-entrypoint.sh idempotently creates a
+      # superuser with a verified email on boot. Empty defaults disable it.
+      DJANGO_SUPERUSER_EMAIL: "${DJANGO_SUPERUSER_EMAIL:-}"
+      DJANGO_SUPERUSER_PASSWORD: "${DJANGO_SUPERUSER_PASSWORD:-}"
+    volumes:
+      - static_data:/app/static
+      - media_data:/app/media
+
+  validator-worker:
+    build:
+      context: .
+      target: worker
+    depends_on:
+      validator-db:
+        condition: service_healthy
+      validator-redis:
+        condition: service_healthy
+      c5tools:
+        condition: service_started
+    environment:
+      SECRET_KEY: ${SECRET_KEY:?SECRET_KEY is required. Copy .env.example to .env and edit it before running docker compose up.}
+      DEBUG: "${DEBUG:-False}"
+      DB_NAME: ${DB_NAME:-coval}
+      DB_USER: ${DB_USER:-coval}
+      DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required. Copy .env.example to .env and edit it before running docker compose up.}
+      DB_HOST: validator-db
+      DB_PORT: ${DB_PORT:-5432}
+      REDIS_HOST: ${REDIS_HOST:-validator-redis}
+      REDIS_PORT: ${REDIS_PORT:-6379}
+      VALIDATION_MODULES_URLS: ${VALIDATION_MODULES_URLS:-http://c5tools:8080/}
+      # The worker sends operator-notification and daily-report emails, so it
+      # needs the same mail config as web (see x-email-env above). Without this
+      # it would fall back to the SMTP default and fail once operators/admins
+      # are configured to receive mail.
+      <<: *email-env
+    volumes:
+      - media_data:/app/media
+
+  validator-frontend:
+    build:
+      context: .
+      target: frontend
+    depends_on:
+      - validator-web
+    volumes:
+      - static_data:/var/www/static:ro
+      - media_data:/var/www/media:ro
+    ports:
+      - "${DOCKER_FRONTEND_PORT:-8888}:80"
+
+volumes:
+  postgres_data:
+  static_data:
+  media_data:
